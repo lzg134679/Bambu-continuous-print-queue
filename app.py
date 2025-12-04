@@ -10,6 +10,12 @@ import random
 import string
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
+try:
+    import tkinter as _tk
+    from tkinter import filedialog as _filedialog
+except Exception:
+    _tk = None
+    _filedialog = None
 import threading
 import webbrowser
 import time
@@ -17,6 +23,7 @@ import requests
 import shutil
 import tempfile
 import uuid
+import urllib.parse
 
 # 获取当前文件所在目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -37,8 +44,18 @@ DEFAULT_CONFIG = {
         'token': '',
         'printer_entity': '',
         'ams_count': '4'  #ams数量，无需修改此配置
+    },
+    'local': {
+        'path': ''
+    },
+    'server': {
+        'port': '5000'
     }
 }
+
+# 本地文件默认路径配置
+DEFAULT_CONFIG.setdefault('local', {})
+DEFAULT_CONFIG['local'].setdefault('path', '')
 
 # 全局变量用于存储上传进度
 upload_progress = {
@@ -62,7 +79,10 @@ download_progress = {
     'total_bytes': 0,
     'current_file_progress': 0,
     'current_file_downloaded': 0,
-    'current_file_total': 0
+    'current_file_total': 0,
+    # 最近成功保存到 tempDownload 的文件名（前端用于触发浏览器保存）
+    'last_saved': None,
+    'last_saved_url': None
 }
 
 download_cancel_flag = False
@@ -101,6 +121,18 @@ class ConfigManager:
             }
         except:
             return DEFAULT_CONFIG['ftp']
+
+    def get_local_path(self):
+        try:
+            return self.config.get('local', 'path', fallback=DEFAULT_CONFIG['local']['path'])
+        except:
+            return DEFAULT_CONFIG['local']['path']
+
+    def update_local_path(self, path):
+        if not self.config.has_section('local'):
+            self.config.add_section('local')
+        self.config.set('local', 'path', path or '')
+        self.save_config()
     
     def update_ftp_config(self, host, port, user, password, path):
         """更新FTP配置"""
@@ -134,6 +166,13 @@ class ConfigManager:
         self.config.set('homeassistant', 'token', token)
         self.config.set('homeassistant', 'printer_entity', printer_entity)
         self.save_config()
+
+    def get_server_port(self):
+        """获取服务器端口，优先从配置文件读取，失败则返回默认5000"""
+        try:
+            return int(self.config.get('server', 'port', fallback='5000'))
+        except Exception:
+            return 5000
 
 config_manager = ConfigManager()
 
@@ -710,27 +749,44 @@ class SimpleFTPSClient:
             return host, port
         return None, None
 
-def get_3mf_files():
-    """获取3mf文件夹内的文件信息"""
+def get_3mf_files(folder_path=None):
+    """获取指定文件夹内的 .3mf 文件信息。若未提供 folder_path，则默认使用 '3mf' 文件夹（向后兼容）。"""
     files = []
-    folder_path = '3mf'
-    
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
+
+    # 如果未提供路径，使用默认的3mf文件夹
+    if not folder_path:
+        folder_path = '3mf'
+
+    # 展开用户与环境变量并去除首尾空白
+    folder_path = os.path.expanduser(os.path.expandvars(folder_path)).strip()
+
+    # 如果传入的是相对路径，则基于当前程序目录解析
+    if not os.path.isabs(folder_path):
+        folder_path = os.path.join(current_dir, folder_path)
+
+    # 如果目录不存在，直接返回空列表（不自动创建任意传入目录）
+    if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
         return files
-    
-    for filename in os.listdir(folder_path):
-        if filename.lower().endswith('.3mf'):
-            file_path = os.path.join(folder_path, filename)
-            stat = os.stat(file_path)
-            files.append({
-                'name': filename,
-                'size': stat.st_size,
-                'size_formatted': format_file_size(stat.st_size),
-                'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
-                'path': file_path
-            })
-    
+
+    try:
+        for filename in os.listdir(folder_path):
+            if filename.lower().endswith('.3mf'):
+                file_path = os.path.join(folder_path, filename)
+                try:
+                    stat = os.stat(file_path)
+                    files.append({
+                        'name': filename,
+                        'size': stat.st_size,
+                        'size_formatted': format_file_size(stat.st_size),
+                        'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                        'path': file_path
+                    })
+                except Exception:
+                    # 忽略无法访问的文件
+                    continue
+    except Exception:
+        return files
+
     return files
 
 def format_file_size(size_bytes):
@@ -1168,14 +1224,46 @@ def update_upload_session(upload_id, status, message, current_file=None, current
 @app.route('/')
 def index():
     """主页面"""
-    return render_template('index.html')
+    # 将程序运行目录传递给前端作为默认本地路径
+    return render_template('index.html', current_dir=current_dir)
 
 @app.route('/api/files')
 def get_files():
     """获取本地文件列表API"""
     try:
-        files = get_3mf_files()
+        # 支持通过查询参数传入目录路径
+        req_path = request.args.get('path')
+        if req_path:
+            files = get_3mf_files(req_path)
+        else:
+            # 默认使用程序运行目录
+            files = get_3mf_files(current_dir)
         return jsonify({'success': True, 'files': files})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/pick-folder', methods=['GET'])
+def pick_folder():
+    """在服务器端弹出本地文件夹选择对话框，返回选中的路径（仅在本地运行有效）"""
+    try:
+        if _tk is None or _filedialog is None:
+            return jsonify({'success': False, 'error': '服务器不支持图形文件对话框'})
+
+        root = _tk.Tk()
+        root.withdraw()
+        # 确保对话框在最前
+        try:
+            root.attributes('-topmost', True)
+        except Exception:
+            pass
+        folder = _filedialog.askdirectory()
+        root.destroy()
+
+        if folder:
+            return jsonify({'success': True, 'path': folder})
+        else:
+            return jsonify({'success': False, 'path': ''})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -1240,8 +1328,9 @@ def handle_config():
     if request.method == 'GET':
         # 获取配置
         ftp_config = config_manager.get_ftp_config()
+        local_path = config_manager.get_local_path()
         ha_config = config_manager.get_ha_config()
-        return jsonify({'success': True, 'ftp_config': ftp_config, 'ha_config': ha_config})
+        return jsonify({'success': True, 'ftp_config': ftp_config, 'ha_config': ha_config, 'local_path': local_path})
     else:
         # 更新配置
         try:
@@ -1258,9 +1347,27 @@ def handle_config():
                 data.get('ha_token'),
                 data.get('printer_entity')
             )
+            # 更新本地路径（如果有传入）
+            if data and 'local_path' in data:
+                try:
+                    config_manager.update_local_path(data.get('local_path') or '')
+                except Exception:
+                    pass
             return jsonify({'success': True, 'message': '配置保存成功'})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/save-local-path', methods=['POST'])
+def save_local_path():
+    """保存本地路径到config.ini"""
+    try:
+        data = request.get_json() or {}
+        path = data.get('path', '')
+        config_manager.update_local_path(path or '')
+        return jsonify({'success': True, 'path': path})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/test-connection', methods=['POST'])
 def test_connection():
@@ -1496,13 +1603,6 @@ def batch_download_server_files():
         })
 
         config = config_manager.get_ftp_config()
-        client = SimpleFTPSClient(config['host'], config['port'], config['user'], config['password'])
-        
-        # 准备环境
-        success, message = client.prepare_upload_environment('/')
-        if not success:
-            client.quit()
-            return jsonify({'success': False, 'error': message})
         
         # 初始化下载进度
         total_files = len(files)
@@ -1537,61 +1637,83 @@ def batch_download_server_files():
             download_progress['status'] = 'downloading'
             download_progress['message'] = f'开始下载文件 {filename} ({index+1}/{total_files})'
 
-            # 切换到文件所在目录
-            success, message = client.change_directory(file_path)
-            if not success:
-                print(f"无法切换到目录 {file_path}: {message}")
-                continue
-            
-            local_path = os.path.join(download_dir, filename)
-            
-            # 定义进度回调函数
-            def progress_callback(current_file, downloaded_bytes):
-                progress = (downloaded_bytes / total_bytes) * 100 if total_bytes > 0 else 0
-                # 计算当前文件进度
-                progress = (downloaded_bytes / total_bytes) * 100 if total_bytes > 0 else 0
-                
-                # 更新当前文件进度
-                download_progress['current_file_downloaded'] = downloaded_bytes
-                download_progress['current_file_progress'] = progress
-                
-                # 计算总体进度
-                # 已完成文件数 * 100 + 当前文件进度
-                overall_progress = ((index * 100) + progress) / total_files
-                
-                # 更新总体进度
-                download_progress['progress'] = overall_progress
-                download_progress['downloaded_bytes'] = sum(f['size'] for f in files[:index]) + downloaded_bytes
-                download_progress['message'] = (
-                    f'{filename}: {progress:.1f}% '
-                    f'({format_file_size(downloaded_bytes)} / {format_file_size(total_bytes)}) '
-                    f'- 文件 {index+1}/{total_files}'
-                )
-            
-            # 下载文件
-            success, result = client.download_file(filename, local_path, progress_callback=progress_callback)
-            
-            if success:
-                downloaded_files.append({
-                    'name': filename,
-                    'path': local_path,
-                    'success': True
-                })
-                download_progress['current_file_progress'] = 100
-                download_progress['downloaded_bytes'] = sum(f['size'] for f in files[:index+1])
-                download_progress['progress'] = ((index + 1) * 100) / total_files
-                download_progress['message'] = f'文件 {filename} 下载成功 ({index+1}/{total_files})'
-            else:
-                downloaded_files.append({
-                    'name': filename,
-                    'path': None,
-                    'success': False,
-                    'error': result
-                })
-                print(f"下载文件 {filename} 失败: {result}")
-            
-            # 文件间短暂延迟
-            time.sleep(1)
+            # 为每个文件使用新的 FTP 连接（避免复用同一连接导致的问题）
+            client = SimpleFTPSClient(config['host'], config['port'], config['user'], config['password'])
+            try:
+                success, message = client.connect()
+                if not success:
+                    downloaded_files.append({'name': filename, 'path': None, 'success': False, 'error': f'连接失败: {message}'})
+                    print(f"连接失败: {message}")
+                    continue
+
+                success, message = client.login()
+                if not success:
+                    downloaded_files.append({'name': filename, 'path': None, 'success': False, 'error': f'登录失败: {message}'})
+                    client.quit()
+                    continue
+
+                # 切换到文件所在目录
+                success, message = client.change_directory(file_path)
+                if not success:
+                    downloaded_files.append({'name': filename, 'path': None, 'success': False, 'error': f'切换目录失败: {message}'})
+                    client.quit()
+                    continue
+
+                local_path = os.path.join(download_dir, filename)
+
+                # 定义进度回调函数
+                def progress_callback(current_file, downloaded_bytes):
+                    progress = (downloaded_bytes / total_bytes) * 100 if total_bytes > 0 else 0
+
+                    # 更新当前文件进度
+                    download_progress['current_file_downloaded'] = downloaded_bytes
+                    download_progress['current_file_progress'] = progress
+
+                    # 计算总体进度：已完成文件数 *100 + 当前文件进度
+                    overall_progress = ((index * 100) + progress) / total_files
+                    download_progress['progress'] = overall_progress
+                    download_progress['downloaded_bytes'] = sum(f['size'] for f in files[:index]) + downloaded_bytes
+                    download_progress['message'] = (
+                        f'{filename}: {progress:.1f}% '
+                        f'({format_file_size(downloaded_bytes)} / {format_file_size(total_bytes)}) '
+                        f'- 文件 {index+1}/{total_files}'
+                    )
+
+                # 下载文件（每个文件独立连接）
+                success, result = client.download_file(filename, local_path, progress_callback=progress_callback)
+
+                if success:
+                    downloaded_files.append({'name': filename, 'path': local_path, 'success': True})
+
+                    # 标记当前文件已保存到 tempDownload，并通知前端触发浏览器保存
+                    encoded_name = urllib.parse.quote(filename)
+                    download_progress['current_file_progress'] = 100
+                    download_progress['downloaded_bytes'] = sum(f['size'] for f in files[:index+1])
+                    download_progress['progress'] = ((index + 1) * 100) / total_files
+                    download_progress['message'] = f'文件 {filename} 下载成功 ({index+1}/{total_files})'
+                    download_progress['last_saved'] = filename
+                    download_progress['last_saved_url'] = f'/tempDownload/{encoded_name}'
+
+                    # 在单独线程中延迟删除临时文件（与单文件行为一致）
+                    def delayed_delete(file_path, delay_seconds=30):
+                        time.sleep(delay_seconds)
+                        try:
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                        except Exception as e:
+                            print(f"删除临时文件失败 {file_path}: {e}")
+                    threading.Thread(target=delayed_delete, args=(local_path,), daemon=True).start()
+                else:
+                    downloaded_files.append({'name': filename, 'path': None, 'success': False, 'error': result})
+                    print(f"下载文件 {filename} 失败: {result}")
+
+                # 等待短暂延迟再处理下一个文件
+                time.sleep(1)
+            finally:
+                try:
+                    client.quit()
+                except:
+                    pass
         
         client.quit()
         
@@ -1601,7 +1723,9 @@ def batch_download_server_files():
             'progress': 100,
             'current_file_index': total_files,
             'status': 'success',
-            'message': f'所有文件下载完成，共{total_files}个文件'
+            'message': f'所有文件下载完成，共{total_files}个文件',
+            'last_saved': None,
+            'last_saved_url': None
         })
         
         return jsonify({
@@ -2164,24 +2288,31 @@ def start_print():
         print(f"\n开始打印请求失败: {str(e)}")
         return jsonify({'success': False, 'error': str(e)})
 
-def open_browser():
-    """打开浏览器"""
-    #time.sleep(1.5)
-    webbrowser.open('http://127.0.0.1:5000')
+def open_browser(port):
+    """打开浏览器 (指定端口)"""
+    try:
+        webbrowser.open(f'http://127.0.0.1:{port}')
+    except Exception:
+        # 忽略打开浏览器的错误
+        pass
 
 if __name__ == '__main__':
-    # 确保必要的文件夹存在
-    if not os.path.exists('3mf'):
-        os.makedirs('3mf')
     if not os.path.exists('temp'):
         os.makedirs('temp')
     if not os.path.exists('tempDownload'):
         os.makedirs('tempDownload')
     
-    # 在单独的线程中打开浏览器
-    threading.Thread(target=open_browser).start()
+    # 计算端口：环境变量优先 -> config.ini -> 默认5000
+    port_env = os.environ.get('PORT') or os.environ.get('BROWSER_PORT')
+    try:
+        port = int(port_env) if port_env else config_manager.get_server_port()
+    except Exception:
+        port = 5000
+
+    # 在单独的线程中打开浏览器（传入端口）
+    threading.Thread(target=open_browser, args=(port,)).start()
     
     # 启动Flask应用
-    print("启动服务器...")
-    print("浏览器将自动打开，如果没有自动打开，请手动访问: http://127.0.0.1:5000")
-    app.run(debug=False, host='127.0.0.1', port=5000)
+    print(f"启动服务...")
+    print(f"浏览器将自动打开，如果没有自动打开，请手动访问: http://127.0.0.1:{port}")
+    app.run(debug=False, host='127.0.0.1', port=port)

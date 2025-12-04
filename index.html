@@ -1686,6 +1686,8 @@
     </style>
 </head>
 <body>
+    <!-- Flask 注入的数据（隐藏），避免在脚本中直接使用 Jinja 表达式导致编辑器语法报错 -->
+    <div id="flask-data" style="display:none" data-current-dir="{{ current_dir|e }}"></div>
     <div class="container">
         <div class="header">
             <h1>拓竹连续打印队列生成</h1>
@@ -1697,6 +1699,13 @@
             <div class="section">
                 <div class="section-title">
                     <span>本地文件<span id="localFileCount" class="file-count">(0)</span></span>
+                    <div class="server-nav" style="justify-content: center; flex: 1;">
+                        <div class="path-input-group" style="margin: 0 auto;">
+                            <input type="text" class="path-input" id="localPathInput" placeholder="选择或输入本地文件夹路径">
+                            <button class="path-btn" onclick="goToLocalPath()">跳转</button>
+                            <button class="path-btn" onclick="browseLocal()">浏览</button>
+                        </div>
+                    </div>
                     <button class="btn btn-primary" onclick="refreshFiles()">
                         🔄 刷新
                     </button>
@@ -2112,6 +2121,7 @@
         let progressPollingInterval = null;
         let lastProgressUpdate = 0;
         let currentServerPath = '/';
+        let currentLocalPath = '';
         let filter3mfOnly = false;
         let automationCreated = false;
         let allServerFiles = [];
@@ -2123,6 +2133,7 @@
         let currentBatchDownload = null;
         let batchDownloadPollingInterval = null;
         let isDownloadCancelling = false;
+        let batchSavedSet = new Set();
         let fileUploadInput = null;
         let currentUploadId = null;
         let uploadPollingInterval = null;
@@ -2130,10 +2141,29 @@
 
         // 页面加载时初始化
         document.addEventListener('DOMContentLoaded', async function() {
+            // 先尝试从服务器配置加载（如果配置里存在已保存的 local_path，会在 loadConfig 中设置 currentLocalPath）
             await loadConfig();
-            loadFiles();
+
+            // 如果配置里没有保存的路径，再使用后端注入的运行目录作为默认
+            if (!currentLocalPath) {
+                const flaskDataEl = document.getElementById('flask-data');
+                if (flaskDataEl && flaskDataEl.dataset && flaskDataEl.dataset.currentDir) {
+                    currentLocalPath = flaskDataEl.dataset.currentDir || '';
+                } else {
+                    currentLocalPath = '';
+                }
+            }
+
+            // 将默认路径写入输入框（若存在）
+            const localPathEl = document.getElementById('localPathInput');
+            if (localPathEl && currentLocalPath) {
+                localPathEl.value = currentLocalPath;
+            }
+
+            loadFiles(currentLocalPath);
             initFileUpload();
             setupPathInputEvents();
+            setupLocalPathInputEvents();
             loadServerFiles(config_default_path);
         });
         
@@ -2366,6 +2396,7 @@
                 if (data.success) {
                     const ftpConfig = data.ftp_config;
                     const haConfig = data.ha_config;
+                    const savedLocalPath = data.local_path || '';
                     
                     document.getElementById('host').value = ftpConfig.host;
                     document.getElementById('port').value = ftpConfig.port;
@@ -2376,6 +2407,13 @@
                     document.getElementById('ha_url').value = haConfig.url;
                     document.getElementById('ha_token').value = haConfig.token;
                     document.getElementById('printer_entity').value = haConfig.printer_entity;
+
+                    // 如果配置中有保存的本地路径，优先使用它覆盖当前值
+                    if (savedLocalPath) {
+                        currentLocalPath = savedLocalPath;
+                        const localPathEl = document.getElementById('localPathInput');
+                        if (localPathEl) localPathEl.value = currentLocalPath;
+                    }
                 }
             } catch (error) {
                 showErrorModal('加载配置失败: ' + error);
@@ -2495,7 +2533,7 @@
         }
         
         // 加载本地文件列表
-        async function loadFiles() {
+        async function loadFiles(path = null) {
             const fileList = document.getElementById('fileList');
             
             // 创建新的loading元素
@@ -2512,7 +2550,19 @@
             loading.style.display = 'block';
             
             try {
-                const response = await fetch('/api/files');
+                // 切换路径时清除已选文件
+                selectedFiles = [];
+                const selectAllCheckbox = document.getElementById('selectAll');
+                if (selectAllCheckbox) {
+                    selectAllCheckbox.checked = false;
+                    selectAllCheckbox.indeterminate = false;
+                }
+
+                let url = '/api/files';
+                if (path) {
+                    url = '/api/files?path=' + encodeURIComponent(path);
+                }
+                const response = await fetch(url);
                 const data = await response.json();
                 
                 // 清空文件列表（包括loading）
@@ -2559,7 +2609,6 @@
                         <div class="empty-state">
                             <div>📁</div>
                             <div>暂无3MF文件</div>
-                            <div style="font-size: 0.9em; margin-top: 10px;">请将3MF文件放入3mf文件夹中</div>
                         </div>
                     `;
                     document.getElementById('localFileCount').textContent = '(0)';
@@ -2851,6 +2900,69 @@
             });
         }
 
+        // 本地路径输入回车支持与浏览/跳转功能
+        function setupLocalPathInputEvents() {
+            const pathInput = document.getElementById('localPathInput');
+            if (!pathInput) return;
+
+            pathInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    goToLocalPath();
+                }
+            });
+
+            pathInput.addEventListener('focus', function() {
+                setTimeout(() => { this.select(); }, 50);
+            });
+        }
+
+        function goToLocalPath() {
+            const path = document.getElementById('localPathInput').value.trim();
+            if (path) {
+                currentLocalPath = path;
+                loadFiles(currentLocalPath);
+                // 保存到配置文件
+                try {
+                    fetch('/api/save-local-path', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path: currentLocalPath })
+                    });
+                } catch (e) {
+                    console.error('保存本地路径失败', e);
+                }
+            } else {
+                // 如果为空则使用程序运行目录
+                currentLocalPath = '';
+                loadFiles(currentLocalPath);
+            }
+        }
+
+        async function browseLocal() {
+            try {
+                const resp = await fetch('/api/pick-folder');
+                const data = await resp.json();
+                if (data.success && data.path) {
+                    currentLocalPath = data.path;
+                    const el = document.getElementById('localPathInput');
+                    if (el) el.value = currentLocalPath;
+                    loadFiles(currentLocalPath);
+                    // 保存到配置文件
+                    try {
+                        await fetch('/api/save-local-path', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ path: currentLocalPath })
+                        });
+                    } catch (e) {
+                        console.error('保存本地路径失败', e);
+                    }
+                }
+            } catch (e) {
+                console.error('浏览本地文件夹失败', e);
+            }
+        }
+
         // 切换3MF过滤器
         function toggle3mfFilter() {
             filter3mfOnly = document.getElementById('filter3mf').checked;
@@ -2902,7 +3014,7 @@
         
         // 刷新本地文件列表
         function refreshFiles() {
-            loadFiles();
+            loadFiles(currentLocalPath);
         }
         
         // 刷新服务器文件列表
@@ -3305,6 +3417,8 @@
             }
             // 显示批量下载弹窗
             showBatchDownloadProgressModal(filesToDownload);
+            // 清理已保存记录，避免上次批量下载的文件再次触发保存
+            batchSavedSet.clear();
             startBatchDownloadProgressPolling();
             
             try {
@@ -3619,6 +3733,26 @@
                         已下载: ${downloadedFormatted} / ${totalFormatted} (${overallPercentage.toFixed(1)}%)
                     </div>
                 `;
+            }
+
+            // 如果后端告知最近已保存的单个文件，触发浏览器保存（避免重复触发）
+            if (progress.last_saved_url) {
+                try {
+                    const url = progress.last_saved_url;
+                    if (!batchSavedSet.has(url)) {
+                        batchSavedSet.add(url);
+                        const filename = progress.last_saved || decodeURIComponent(url.split('/').pop());
+                        const downloadLink = document.createElement('a');
+                        downloadLink.href = url;
+                        downloadLink.download = filename;
+                        downloadLink.style.display = 'none';
+                        document.body.appendChild(downloadLink);
+                        downloadLink.click();
+                        document.body.removeChild(downloadLink);
+                    }
+                } catch (e) {
+                    console.warn('自动保存批量下载文件失败:', e);
+                }
             }
         }
 
