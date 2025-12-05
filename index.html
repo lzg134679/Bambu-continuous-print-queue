@@ -2138,9 +2138,41 @@
         let currentUploadId = null;
         let uploadPollingInterval = null;
         let isUploadCancelling = false;
+        let runtimeBasePath = '';
+
+        // 将后端运行目录与相对路径拼接，便于文件访问
+        function withRuntimePath(path) {
+            if (!path) return path;
+            if (/^https?:\/\//i.test(path)) return path;
+            const base = (runtimeBasePath || '').replace(/\\/g, '/').replace(/\/+$/, '');
+            if (!base) return path;
+            const cleaned = path.replace(/^[\\/]+/, '');
+            const isAbsFs = /^[a-zA-Z]:\//.test(base) || base.startsWith('/');
+            // 绝对文件路径无法被浏览器直接加载，回退到当前站点的绝对路径
+            if (isAbsFs) {
+                return `${window.location.origin}/${cleaned}`;
+            }
+            return `${base}/${cleaned}`;
+        }
+
+        async function loadRuntimeInfo() {
+            try {
+                const res = await fetch('/api/runtime-info');
+                if (!res.ok) throw new Error(`status ${res.status}`);
+                const data = await res.json();
+                if (data && data.current_dir) {
+                    runtimeBasePath = String(data.current_dir);
+                }
+                console.log('运行目录:', runtimeBasePath);
+            } catch (err) {
+                console.warn('获取运行目录失败:', err);
+                runtimeBasePath = '';
+            }
+        }
 
         // 页面加载时初始化
         document.addEventListener('DOMContentLoaded', async function() {
+            await loadRuntimeInfo();
             // 先尝试从服务器配置加载（如果配置里存在已保存的 local_path，会在 loadConfig 中设置 currentLocalPath）
             await loadConfig();
 
@@ -3356,7 +3388,7 @@
                     
                     // 创建下载链接
                     const downloadLink = document.createElement('a');
-                    downloadLink.href = `/tempDownload/${filename}`;
+                    downloadLink.href = withRuntimePath(`/tempDownload/${filename}`);
                     downloadLink.download = filename;
                     downloadLink.style.display = 'none';
                     document.body.appendChild(downloadLink);
@@ -3738,7 +3770,7 @@
             // 如果后端告知最近已保存的单个文件，触发浏览器保存（避免重复触发）
             if (progress.last_saved_url) {
                 try {
-                    const url = progress.last_saved_url;
+                    const url = withRuntimePath(progress.last_saved_url);
                     if (!batchSavedSet.has(url)) {
                         batchSavedSet.add(url);
                         const filename = progress.last_saved || decodeURIComponent(url.split('/').pop());
@@ -4162,7 +4194,7 @@
                         printQueue.push({
                             filename: file.name,
                             file_path: file.path,
-                            preview_url: data.preview_url,
+                            preview_url: withRuntimePath(data.preview_url),
                             filament_array: data.filament_array,
                             ams_mapping: data.filament_array.map(f => (f === -1 ? -1 : -1)),
                             copies: 1,

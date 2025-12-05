@@ -1,0 +1,1 @@
+PyInstaller -F --add-data "index.html;." -n 打印队列生成 app.py

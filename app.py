@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
         'url': '',
         'token': '',
         'printer_entity': '',
+        'notify_entity': '',
         'ams_count': '4'  #ams数量，无需修改此配置
     },
     'local': {
@@ -153,11 +154,12 @@ class ConfigManager:
                 'url': self.config.get('homeassistant', 'url', fallback=DEFAULT_CONFIG['homeassistant']['url']),
                 'token': self.config.get('homeassistant', 'token', fallback=DEFAULT_CONFIG['homeassistant']['token']),
                 'printer_entity': self.config.get('homeassistant', 'printer_entity', fallback=DEFAULT_CONFIG['homeassistant']['printer_entity']),
+                'notify_entity': self.config.get('homeassistant', 'notify_entity', fallback=DEFAULT_CONFIG['homeassistant'].get('notify_entity', '')),
             }
         except:
             return DEFAULT_CONFIG['homeassistant']
     
-    def update_ha_config(self, url, token, printer_entity):
+    def update_ha_config(self, url, token, printer_entity, notify_entity=None):
         """更新Home Assistant配置"""
         if not self.config.has_section('homeassistant'):
             self.config.add_section('homeassistant')
@@ -165,6 +167,8 @@ class ConfigManager:
         self.config.set('homeassistant', 'url', url)
         self.config.set('homeassistant', 'token', token)
         self.config.set('homeassistant', 'printer_entity', printer_entity)
+        # 保存通知文本实体配置（可选）
+        self.config.set('homeassistant', 'notify_entity', notify_entity or '')
         self.save_config()
 
     def get_server_port(self):
@@ -563,9 +567,9 @@ class SimpleFTPSClient:
             if not success:
                 return False, msg
             
-            # 如果没有指定本地路径，使用当前目录
+            # 如果没有指定本地路径，使用程序目录下的 tempDownload
             if local_path is None:
-                local_path = os.path.join('tempDownload', remote_filename)
+                local_path = os.path.join(current_dir, 'tempDownload', remote_filename)
             
             # 确保下载目录存在
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -1011,9 +1015,21 @@ def generate_automation_yaml(print_queue, webhook_id, printer_entity, device_id)
         "mode": "single"
     }
     
+    # 计算总打印任务数（考虑副本数）
+    total_jobs = 0
+    for file_config in print_queue:
+        if isinstance(file_config, dict):
+            try:
+                copies = int(file_config.get('copies', 1))
+            except Exception:
+                copies = 1
+        else:
+            copies = 1
+        total_jobs += copies
+
     # 为每个打印文件生成动作
     for file_config in print_queue:
-        copies = file_config.get('copies', 1)
+        copies = file_config.get('copies', 1) if isinstance(file_config, dict) else 1
 
         # 计算盘号：优先使用 file_config 中的 plate 或 plate_index 字段，
         # 其次尝试从 gcode_file、preview_url、file_path 中提取
@@ -1094,7 +1110,7 @@ def generate_automation_yaml(print_queue, webhook_id, printer_entity, device_id)
                             "delay": {
                                 "hours": 0,
                                 "minutes": 0,
-                                "seconds": 5,
+                                "seconds": 15,
                                 "milliseconds": 0
                             }
                         }
@@ -1142,6 +1158,33 @@ def generate_automation_yaml(print_queue, webhook_id, printer_entity, device_id)
                     "milliseconds": 0
                 }
             })
+
+    # 根据配置决定是否添加通知文本动作
+    try:
+        ha_conf = config_manager.get_ha_config()
+        notify_entity = (ha_conf.get('notify_entity') or '').strip()
+    except Exception:
+        notify_entity = ''
+
+    if notify_entity:
+        # 从 printer_entity 中提取显示名称
+        try:
+            display_name = printer_entity.split('_', 1)[0] if printer_entity else ''
+        except Exception:
+            display_name = printer_entity or ''
+
+        message = f"{display_name}的{total_jobs}个队列打印任务已完成"
+
+        automation["actions"].append({
+            "action": "text.set_value",
+            "metadata": {},
+            "data": {
+                "value": message
+            },
+            "target": {
+                "entity_id": notify_entity
+            }
+        })
     
     return automation
 
@@ -1345,7 +1388,8 @@ def handle_config():
             config_manager.update_ha_config(
                 data.get('ha_url'),
                 data.get('ha_token'),
-                data.get('printer_entity')
+                data.get('printer_entity'),
+                data.get('notify_entity')
             )
             # 更新本地路径（如果有传入）
             if data and 'local_path' in data:
@@ -1472,8 +1516,8 @@ def download_server_file():
             client.quit()
             return jsonify({'success': False, 'error': message})
         
-        # 下载文件到download目录
-        download_dir = 'tempDownload'
+        # 下载文件到程序目录下的 tempDownload
+        download_dir = os.path.join(current_dir, 'tempDownload')
         os.makedirs(download_dir, exist_ok=True)
         local_path = os.path.join(download_dir, filename)
         # 如果前端未提供 total_bytes（0），尝试从服务器获取文件大小以便计算进度
@@ -1546,10 +1590,18 @@ def download_server_file():
                     print(f"删除临时文件失败 {file_path}: {e}")
             threading.Thread(target=delayed_delete, args=(local_path,), daemon=True).start()
             
+            # 标记已保存并提供外部可访问的 URL，方便前端直接触发浏览器下载
+            encoded_name = urllib.parse.quote(filename)
+            file_url = f'/tempDownload/{urllib.parse.quote(filename)}'
+
+            download_progress['last_saved'] = filename
+            download_progress['last_saved_url'] = file_url
+
             return jsonify({
-                'success': True, 
+                'success': True,
                 'message': f'文件 {filename} 下载成功',
-                'file_path': local_path
+                'file_path': local_path,
+                'file_url': file_url
             })
         else:
             update_download_progress(
@@ -1621,7 +1673,7 @@ def batch_download_server_files():
         }
         
         downloaded_files = []
-        download_dir = 'tempDownload'
+        download_dir = os.path.join(current_dir, 'tempDownload')
         os.makedirs(download_dir, exist_ok=True)
         
         for index, file_info in enumerate(files):
@@ -1692,7 +1744,7 @@ def batch_download_server_files():
                     download_progress['progress'] = ((index + 1) * 100) / total_files
                     download_progress['message'] = f'文件 {filename} 下载成功 ({index+1}/{total_files})'
                     download_progress['last_saved'] = filename
-                    download_progress['last_saved_url'] = f'/tempDownload/{encoded_name}'
+                    download_progress['last_saved_url'] = f'/tempDownload/{urllib.parse.quote(filename)}'
 
                     # 在单独线程中延迟删除临时文件（与单文件行为一致）
                     def delayed_delete(file_path, delay_seconds=30):
@@ -1749,8 +1801,23 @@ def batch_download_server_files():
 
 @app.route('/tempDownload/<path:filename>')
 def download_file(filename):
-    """提供下载文件访问"""
-    return send_from_directory('tempDownload', filename, as_attachment=True)
+    """提供下载文件访问（使用程序目录下的 tempDownload）"""
+    download_dir = os.path.join(current_dir, 'tempDownload')
+    return send_from_directory(download_dir, filename, as_attachment=True)
+
+
+@app.route('/api/runtime-info')
+def runtime_info():
+    """返回运行时信息：程序目录和主机 URL 等，供前端使用绝对路径请求文件（在单文件打包时有用）"""
+    try:
+        host_url = request.host_url if request else ''
+    except Exception:
+        host_url = ''
+
+    info = {
+        'current_dir': os.path.abspath(current_dir)
+    }
+    return jsonify(info)
 
 @app.route('/api/cancel-download', methods=['POST'])
 def cancel_download():
@@ -1798,9 +1865,9 @@ def analyze_3mf():
         if not file_path or not os.path.exists(file_path):
             return jsonify({'success': False, 'error': '文件不存在'})
         
-        # 创建临时解压目录
+        # 创建临时解压目录（程序目录下的 temp）
         file_name = os.path.basename(file_path)
-        temp_dir = os.path.join('temp', file_name.replace('.3mf', ''))
+        temp_dir = os.path.join(current_dir, 'temp', file_name.replace('.3mf', ''))
         
         # 解压文件
         success, message = extract_3mf_file(file_path, temp_dir)
@@ -1857,7 +1924,10 @@ def analyze_3mf():
             if fallback_preview:
                 # fallback_preview 是本地路径，如 temp/<name>/Metadata/plate_1.png
                 rel = os.path.relpath(fallback_preview, start=os.path.join('temp'))
-                preview_url = f"/temp/{rel}" if rel else None
+                if rel:
+                    preview_url = f"/temp/{rel}"
+                else:
+                    preview_url = None
 
         # 获取耗材信息
         filament_array, filament_message = get_3mf_filament_info(temp_dir)
@@ -1878,7 +1948,8 @@ def analyze_3mf():
 @app.route('/temp/<path:filename>')
 def serve_temp_files(filename):
     """提供临时文件的访问"""
-    return send_from_directory('temp', filename)
+    temp_dir = os.path.join(current_dir, 'temp')
+    return send_from_directory(temp_dir, filename)
 
 @app.route('/api/get-filament-mapping')
 def get_filament_mapping_api():
@@ -2297,11 +2368,6 @@ def open_browser(port):
         pass
 
 if __name__ == '__main__':
-    if not os.path.exists('temp'):
-        os.makedirs('temp')
-    if not os.path.exists('tempDownload'):
-        os.makedirs('tempDownload')
-    
     # 计算端口：环境变量优先 -> config.ini -> 默认5000
     port_env = os.environ.get('PORT') or os.environ.get('BROWSER_PORT')
     try:
