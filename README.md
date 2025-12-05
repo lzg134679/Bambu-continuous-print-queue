@@ -1,6 +1,7 @@
 # 拓竹连续队列打印系统
 
 一个用于拓竹3D打印机的自动化打印队列管理系统，需要有homeassistant和自动换盘，支持通过FTP上传文件、Home Assistant集成，并自动生成连续打印自动化配置。
+【【拓竹连续队列打印】配合HA和自动换盘的自动化生成-源码开源】 https://www.bilibili.com/video/BV1Tm2vBcE6j/?share_source=copy_web&vd_source=235f7e0190ffb5dfaf2098f46ea150bf
 
 ## 功能特性
 
@@ -10,19 +11,11 @@
 - **队列管理**：拖拽排序打印队列，支持多份打印配置
 - **自动化生成**：自动生成Home Assistant自动化配置，实现连续打印
 
-### v1.0.0
-- 初始版本发布
-- 支持FTP文件管理
-- Home Assistant自动化集成
-- 3MF文件分析和预览
-- 打印队列配置和管理
-
-
 ## 系统需求
 
 - Python 3.8+
 - 拓竹3D打印机（有换盘组件，打印机系统版本不能有mqtt通讯加密或新版本打开局域网模式使用）
-- Home Assistant（必须，用于自动化功能）
+- Home Assistant（必须，用于自动化功能，可以在B站搜索windows环境的homeassistant一键端）
 - 网页浏览器
 
 ## 安装步骤
@@ -127,5 +120,6 @@ ams_count = 4                      # AMS数量（默认最大为4不需要更改
 4. 点击创建新令牌并复制
 
 ## 贡献指南
+
 
 欢迎提交问题
